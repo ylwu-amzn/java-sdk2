@@ -5,6 +5,9 @@
 package io.modelcontextprotocol.spec;
 
 import java.io.IOException;
+import java.security.AccessController;
+import java.security.PrivilegedActionException;
+import java.security.PrivilegedExceptionAction;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -152,15 +155,23 @@ public final class McpSchema {
 
 		var map = objectMapper.readValue(jsonText, MAP_TYPE_REF);
 
-		// Determine message type based on specific JSON structure
-		if (map.containsKey("method") && map.containsKey("id")) {
-			return objectMapper.convertValue(map, JSONRPCRequest.class);
+		try {
+			// Determine message type based on specific JSON structure
+			if (map.containsKey("method") && map.containsKey("id")) {
+				return AccessController.doPrivileged((PrivilegedExceptionAction<JSONRPCMessage>) () -> objectMapper
+					.convertValue(map, JSONRPCRequest.class));
+			}
+			else if (map.containsKey("method") && !map.containsKey("id")) {
+				return AccessController.doPrivileged((PrivilegedExceptionAction<JSONRPCMessage>) () -> objectMapper
+					.convertValue(map, JSONRPCNotification.class));
+			}
+			else if (map.containsKey("result") || map.containsKey("error")) {
+				return AccessController.doPrivileged((PrivilegedExceptionAction<JSONRPCMessage>) () -> objectMapper
+					.convertValue(map, JSONRPCResponse.class));
+			}
 		}
-		else if (map.containsKey("method") && !map.containsKey("id")) {
-			return objectMapper.convertValue(map, JSONRPCNotification.class);
-		}
-		else if (map.containsKey("result") || map.containsKey("error")) {
-			return objectMapper.convertValue(map, JSONRPCResponse.class);
+		catch (Exception e) {
+			throw new RuntimeException(e);
 		}
 
 		throw new IllegalArgumentException("Cannot deserialize JSONRPCMessage: " + jsonText);

@@ -20,6 +20,9 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.security.AccessController;
+import java.security.PrivilegedActionException;
+import java.security.PrivilegedExceptionAction;
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -119,6 +122,17 @@ public class HttpClientSseClientTransport implements ClientMcpTransport {
 		this.sseClient = new FlowSseClient(this.httpClient);
 	}
 
+	public HttpClientSseClientTransport(HttpClient httpClient, String baseUri, ObjectMapper objectMapper) {
+		Assert.notNull(objectMapper, "ObjectMapper must not be null");
+		Assert.hasText(baseUri, "baseUri must not be empty");
+		Assert.notNull(httpClient, "httpClient must not be null");
+		this.httpClient = httpClient;
+		// Rest of initialization remains same
+		this.baseUri = baseUri;
+		this.objectMapper = objectMapper;
+		this.sseClient = new FlowSseClient(this.httpClient);
+	}
+
 	/**
 	 * Establishes the SSE connection with the server and sets up message handling.
 	 *
@@ -152,14 +166,21 @@ public class HttpClientSseClientTransport implements ClientMcpTransport {
 						future.complete(null);
 					}
 					else if (MESSAGE_EVENT_TYPE.equals(event.type())) {
-						JSONRPCMessage message = McpSchema.deserializeJsonRpcMessage(objectMapper, event.data());
+						// Wrap the Jackson deserialization in a privileged action
+						JSONRPCMessage message = AccessController
+							.doPrivileged((PrivilegedExceptionAction<JSONRPCMessage>) () -> McpSchema
+								.deserializeJsonRpcMessage(objectMapper, event.data()));
 						handler.apply(Mono.just(message)).subscribe();
 					}
 					else {
 						logger.error("Received unrecognized SSE event type: {}", event.type());
 					}
 				}
-				catch (IOException e) {
+				catch (PrivilegedActionException e) {
+					logger.error("Error processing SSE event", e.getException());
+					future.completeExceptionally(e.getException());
+				}
+				catch (Exception e) {
 					logger.error("Error processing SSE event", e);
 					future.completeExceptionally(e);
 				}
@@ -207,28 +228,27 @@ public class HttpClientSseClientTransport implements ClientMcpTransport {
 			return Mono.error(new McpError("No message endpoint available"));
 		}
 
-		try {
-			String jsonText = this.objectMapper.writeValueAsString(message);
-			HttpRequest request = HttpRequest.newBuilder()
-				.uri(URI.create(this.baseUri + endpoint))
-				.header("Content-Type", "application/json")
-				.POST(HttpRequest.BodyPublishers.ofString(jsonText))
-				.build();
+		return Mono.fromCallable(() -> {
+			try {
+				return AccessController.doPrivileged((PrivilegedExceptionAction<Void>) () -> {
+					String jsonText = this.objectMapper.writeValueAsString(message);
+					HttpRequest request = HttpRequest.newBuilder()
+						.uri(URI.create(this.baseUri + endpoint))
+						.header("Content-Type", "application/json")
+						.POST(HttpRequest.BodyPublishers.ofString(jsonText))
+						.build();
 
-			return Mono.fromFuture(
-					httpClient.sendAsync(request, HttpResponse.BodyHandlers.discarding()).thenAccept(response -> {
-						if (response.statusCode() != 200 && response.statusCode() != 201 && response.statusCode() != 202
-								&& response.statusCode() != 206) {
-							logger.error("Error sending message: {}", response.statusCode());
-						}
-					}));
-		}
-		catch (IOException e) {
-			if (!isClosing) {
-				return Mono.error(new RuntimeException("Failed to serialize message", e));
+					httpClient.send(request, HttpResponse.BodyHandlers.discarding());
+					return null;
+				});
 			}
-			return Mono.empty();
-		}
+			catch (Exception e) {
+				if (!isClosing) {
+					throw new RuntimeException("Failed to send message", e);
+				}
+				return null;
+			}
+		});
 	}
 
 	/**
@@ -259,7 +279,13 @@ public class HttpClientSseClientTransport implements ClientMcpTransport {
 	 */
 	@Override
 	public <T> T unmarshalFrom(Object data, TypeReference<T> typeRef) {
-		return this.objectMapper.convertValue(data, typeRef);
+		try {
+			return AccessController
+				.doPrivileged((PrivilegedExceptionAction<T>) () -> this.objectMapper.convertValue(data, typeRef));
+		}
+		catch (PrivilegedActionException e) {
+			throw new RuntimeException("Error unmarshalling data", e.getCause());
+		}
 	}
 
 }
