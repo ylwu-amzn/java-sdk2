@@ -3,11 +3,13 @@
  */
 package io.modelcontextprotocol.client.transport;
 
-import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.security.AccessController;
+import java.security.PrivilegedActionException;
+import java.security.PrivilegedExceptionAction;
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -355,14 +357,20 @@ public class HttpClientSseClientTransport implements McpClientTransport {
 						future.complete(null);
 					}
 					else if (MESSAGE_EVENT_TYPE.equals(event.type())) {
-						JSONRPCMessage message = McpSchema.deserializeJsonRpcMessage(objectMapper, event.data());
+						JSONRPCMessage message = AccessController
+							.doPrivileged((PrivilegedExceptionAction<JSONRPCMessage>) () -> McpSchema
+								.deserializeJsonRpcMessage(objectMapper, event.data()));
 						handler.apply(Mono.just(message)).subscribe();
 					}
 					else {
 						logger.error("Received unrecognized SSE event type: {}", event.type());
 					}
 				}
-				catch (IOException e) {
+				catch (PrivilegedActionException e) {
+					logger.error("Error processing SSE event", e.getException());
+					future.completeExceptionally(e.getException());
+				}
+				catch (Exception e) {
 					logger.error("Error processing SSE event", e);
 					future.completeExceptionally(e);
 				}
@@ -410,26 +418,26 @@ public class HttpClientSseClientTransport implements McpClientTransport {
 			return Mono.error(new McpError("No message endpoint available"));
 		}
 
-		try {
-			String jsonText = this.objectMapper.writeValueAsString(message);
-			HttpRequest request = this.requestBuilder.uri(URI.create(this.baseUri + endpoint))
-				.POST(HttpRequest.BodyPublishers.ofString(jsonText))
-				.build();
+		return Mono.fromCallable(() -> {
+			try {
+				return AccessController.doPrivileged((PrivilegedExceptionAction<Void>) () -> {
+					String jsonText = this.objectMapper.writeValueAsString(message);
+					HttpRequest request = this.requestBuilder.uri(URI.create(this.baseUri + endpoint))
+						.POST(HttpRequest.BodyPublishers.ofString(jsonText))
+						.build();
 
-			return Mono.fromFuture(
-					httpClient.sendAsync(request, HttpResponse.BodyHandlers.discarding()).thenAccept(response -> {
-						if (response.statusCode() != 200 && response.statusCode() != 201 && response.statusCode() != 202
-								&& response.statusCode() != 206) {
-							logger.error("Error sending message: {}", response.statusCode());
-						}
-					}));
-		}
-		catch (IOException e) {
-			if (!isClosing) {
-				return Mono.error(new RuntimeException("Failed to serialize message", e));
+					httpClient.send(request, HttpResponse.BodyHandlers.discarding());
+					return null;
+				});
+
 			}
-			return Mono.empty();
-		}
+			catch (Exception e) {
+				if (!isClosing) {
+					throw new RuntimeException("Failed to send message", e);
+				}
+				return null;
+			}
+		});
 	}
 
 	/**
@@ -460,7 +468,13 @@ public class HttpClientSseClientTransport implements McpClientTransport {
 	 */
 	@Override
 	public <T> T unmarshalFrom(Object data, TypeReference<T> typeRef) {
-		return this.objectMapper.convertValue(data, typeRef);
+		try {
+			return AccessController
+				.doPrivileged((PrivilegedExceptionAction<T>) () -> this.objectMapper.convertValue(data, typeRef));
+		}
+		catch (PrivilegedActionException e) {
+			throw new RuntimeException("Error unmarshalling data", e.getCause());
+		}
 	}
 
 }
